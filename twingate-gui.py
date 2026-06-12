@@ -1085,7 +1085,8 @@ class TwingateGui(Gtk.Application):
         threading.Thread(target=self._action_worker, args=args, daemon=True).start()
 
     def _action_worker(self, args: tuple[str, ...]):
-        result = run_twingate(*args)
+        input_text = "y\n" if args and args[0] == "start" else None
+        result = run_twingate(*args, input_text=input_text)
         GLib.idle_add(self._apply_action_result, result)
 
     def _apply_action_result(self, result: CommandResult):
