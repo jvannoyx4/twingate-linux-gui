@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unset SNAP
+unset SNAP_NAME
+unset SNAP_INSTANCE_NAME
+unset SNAP_REVISION
+unset SNAP_ARCH
+unset SNAP_COOKIE
+unset SNAP_CONTEXT
+unset SNAP_DATA
+unset SNAP_COMMON
+unset SNAP_USER_DATA
+unset SNAP_USER_COMMON
+unset SNAP_LIBRARY_PATH
+unset SNAP_EUID
+unset SNAP_UID
+unset SNAP_REAL_HOME
+unset SNAP_VERSION
+unset SNAP_LAUNCHER_ARCH_TRIPLET
+unset GDK_PIXBUF_MODULEDIR
+unset GDK_PIXBUF_MODULE_FILE
+unset GIO_LAUNCHED_DESKTOP_FILE
+unset GIO_LAUNCHED_DESKTOP_FILE_PID
+unset GIO_MODULE_DIR
+unset GTK_EXE_PREFIX
+unset GTK_IM_MODULE_FILE
+unset GTK_MODULES
+unset GTK_PATH
+unset XDG_DATA_HOME
+
+export XDG_DATA_DIRS="/usr/share/ubuntu:/usr/share/gnome:${HOME}/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share:/var/lib/snapd/desktop"
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+APP_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+exec /usr/bin/python3 "${APP_DIR}/twingate-gui.py" "$@"

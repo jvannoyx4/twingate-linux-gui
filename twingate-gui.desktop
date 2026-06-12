@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Twingate
+Comment=Desktop controls for the Twingate Linux client
+Exec=twingate-gui
+Icon=twingate-gui
+Terminal=false
+Categories=Network;Security;
+StartupNotify=true
