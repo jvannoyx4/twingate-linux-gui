@@ -55,3 +55,18 @@ If the CLI does not show resources, the GUI will not show them either.
 
 Install the official Twingate Linux client first. This project does not bundle
 or replace the supported Twingate client.
+
+## Update Check Fails
+
+The updater reads the latest release from GitHub. Make sure the machine can
+reach:
+
+```text
+https://api.github.com/repos/jvannoyx4/twingate-linux-gui/releases/latest
+```
+
+If the update install fails, download the release tarball manually and run:
+
+```bash
+./install.sh
+```

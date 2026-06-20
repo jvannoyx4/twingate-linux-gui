@@ -12,6 +12,7 @@ account switching, resource listing, and resource authentication.
 - AppIndicator tray menu with status, active account, resource stats, tunnel details, and account switching.
 - Automatic Chrome/Chromium profile selection for Twingate authentication when the browser profile email matches the Twingate account email.
 - Automatic browser auth launch when a resource enters `Pending` authentication.
+- Built-in GitHub release update checks with one-click in-place upgrade and app restart.
 - Local user install with desktop launcher and icon.
 
 ## Requirements
@@ -89,7 +90,7 @@ The tarball is written to `dist/`.
 Set a specific version:
 
 ```bash
-VERSION=0.1.0 ./scripts/build-release.sh
+VERSION=0.1.2 ./scripts/build-release.sh
 ```
 
 ## Notes

@@ -60,3 +60,14 @@ choose a profile.
 
 `Setup` and `Add Account` open in a terminal because the Twingate CLI can prompt
 for input during those flows.
+
+## Updates
+
+The app checks GitHub releases shortly after startup and then periodically while
+it is running. You can also click the update button in the header or choose
+`Check for Updates` from the tray menu.
+
+When a newer release is available, the app shows an update banner and an
+`Install Update` action in the tray menu. Installing an update downloads the
+release tarball, runs the bundled `install.sh` with the same user install
+prefix, and restarts the app from the upgraded install.

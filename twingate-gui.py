@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 import csv
+import json
 import os
 import re
 import shutil
 import shlex
 import subprocess
+import tarfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import gi
 
@@ -21,6 +27,9 @@ from gi.repository import AppIndicator3, Gdk, GLib, Gtk, Notify, Pango
 
 APP_ID = "io.github.twingate_linux_gui.TwingateGui"
 APP_NAME = "Twingate"
+APP_VERSION = "0.1.2"
+RELEASE_API_URL = "https://api.github.com/repos/jvannoyx4/twingate-linux-gui/releases/latest"
+RELEASE_PAGE_URL = "https://github.com/jvannoyx4/twingate-linux-gui/releases/latest"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR = os.path.join(APP_DIR, "assets")
 ICON_ONLINE = "twingate-tray-online"
@@ -60,12 +69,115 @@ class ConnectionDetails:
     route_count: int
 
 
+@dataclass
+class UpdateInfo:
+    version: str
+    tag: str
+    asset_url: str
+    page_url: str
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 URL_RE = re.compile(r"https://\S+")
 
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
+
+
+def parse_version(value: str) -> tuple[int, ...]:
+    text = value.strip().lstrip("vV")
+    parts = []
+    for part in text.split("."):
+        match = re.match(r"(\d+)", part)
+        parts.append(int(match.group(1)) if match else 0)
+    return tuple(parts or [0])
+
+
+def newer_version(candidate: str, current: str) -> bool:
+    left = list(parse_version(candidate))
+    right = list(parse_version(current))
+    width = max(len(left), len(right))
+    left.extend([0] * (width - len(left)))
+    right.extend([0] * (width - len(right)))
+    return tuple(left) > tuple(right)
+
+
+def fetch_latest_update() -> UpdateInfo | None:
+    request = Request(
+        RELEASE_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"twingate-linux-gui/{APP_VERSION}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            release = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to check for updates: {exc}") from exc
+
+    tag = release.get("tag_name") or ""
+    version = tag.lstrip("vV")
+    if not tag or not newer_version(version, APP_VERSION):
+        return None
+
+    for asset in release.get("assets", []):
+        name = asset.get("name") or ""
+        url = asset.get("browser_download_url") or ""
+        if name.endswith(".tar.gz") and "twingate-linux-gui" in name and url:
+            return UpdateInfo(
+                version=version,
+                tag=tag,
+                asset_url=url,
+                page_url=release.get("html_url") or RELEASE_PAGE_URL,
+            )
+    raise RuntimeError(f"{tag} is available, but no release tarball was found.")
+
+
+def safe_extract_tar(archive_path: str, destination: str) -> None:
+    destination_path = os.path.realpath(destination)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            target_path = os.path.realpath(os.path.join(destination, member.name))
+            if target_path != destination_path and not target_path.startswith(destination_path + os.sep):
+                raise RuntimeError(f"Unsafe path in release archive: {member.name}")
+        archive.extractall(destination)
+
+
+def install_release_update(update: UpdateInfo) -> str:
+    prefix = os.environ.get("PREFIX") or str(Path.home() / ".local")
+    install_command = None
+    with TemporaryDirectory(prefix="twingate-gui-update-") as workdir:
+        archive_path = os.path.join(workdir, os.path.basename(update.asset_url.split("?", 1)[0]))
+        request = Request(
+            update.asset_url,
+            headers={"User-Agent": f"twingate-linux-gui/{APP_VERSION}"},
+        )
+        with urlopen(request, timeout=60) as response, open(archive_path, "wb") as output:
+            shutil.copyfileobj(response, output)
+
+        safe_extract_tar(archive_path, workdir)
+
+        for root, _dirs, files in os.walk(workdir):
+            if "install.sh" in files:
+                install_command = [os.path.join(root, "install.sh")]
+                break
+        if not install_command:
+            raise RuntimeError("Release archive did not contain install.sh.")
+
+        env = os.environ.copy()
+        env["PREFIX"] = prefix
+        result = subprocess.run(
+            install_command,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Installer failed.")
+        return os.path.join(prefix, "bin", "twingate-gui")
 
 
 def email_from_account_id(account_id: str | None) -> str | None:
@@ -298,6 +410,9 @@ class TwingateGui(Gtk.Application):
         self.resource_count_label = None
         self.pending_count_label = None
         self.last_refresh_label = None
+        self.update_box = None
+        self.update_label = None
+        self.update_button = None
         self.connection_status_detail_label = None
         self.connection_account_detail_label = None
         self.connection_ip_detail_label = None
@@ -318,6 +433,16 @@ class TwingateGui(Gtk.Application):
         self.disconnect_item = None
         self.last_status = "unknown"
         self.refresh_running = False
+        self.update_check_running = False
+        self.update_install_running = False
+        self.update_info = None
+        self.update_status = f"Version {APP_VERSION}"
+        self.menu_accounts = None
+        self.menu_active = None
+        self.menu_online = False
+        self.menu_resource_count = 0
+        self.menu_pending_count = 0
+        self.menu_details = None
         self.auto_auth_inflight = set()
         self.auto_auth_attempted = {}
 
@@ -328,6 +453,8 @@ class TwingateGui(Gtk.Application):
         self._load_css()
         self._build_indicator()
         GLib.timeout_add_seconds(30, self._periodic_refresh)
+        GLib.timeout_add_seconds(6 * 60 * 60, self._periodic_update_check)
+        GLib.timeout_add_seconds(15, self._initial_update_check)
 
     def _load_css(self):
         css = b"""
@@ -458,6 +585,12 @@ class TwingateGui(Gtk.Application):
             border-radius: 8px;
         }
 
+        .update-panel {
+            background: #1a1a1d;
+            border: 1px solid #3b82f6;
+            border-radius: 8px;
+        }
+
         .detail-value {
             color: #e8e8ec;
             font-size: 13px;
@@ -531,6 +664,7 @@ class TwingateGui(Gtk.Application):
         if details:
             tunnel_text = f"Tunnel: {details.tunnel_ip} on {details.interface}"
             self.indicator_menu.append(self._menu_item(tunnel_text, sensitive=False))
+        self.indicator_menu.append(self._menu_item(f"App: {self.update_status}", sensitive=False))
 
         self.indicator_menu.append(Gtk.SeparatorMenuItem())
         self.indicator_menu.append(self._menu_item("Open Twingate", lambda _item: self.show_window()))
@@ -538,6 +672,15 @@ class TwingateGui(Gtk.Application):
             self._menu_item("Open Active Network", lambda _item: self.open_active_account_browser(), sensitive=active is not None)
         )
         self.indicator_menu.append(self._menu_item("Refresh", lambda _item: self.refresh()))
+        self.indicator_menu.append(self._menu_item("Check for Updates", lambda _item: self.check_for_updates(manual=True), sensitive=not self.update_check_running and not self.update_install_running))
+        if self.update_info is not None:
+            self.indicator_menu.append(
+                self._menu_item(
+                    f"Install Update {self.update_info.tag}",
+                    lambda _item: self.install_update(),
+                    sensitive=not self.update_install_running,
+                )
+            )
 
         self.indicator_menu.append(Gtk.SeparatorMenuItem())
         self.indicator_menu.append(self._menu_item("Switch Account", sensitive=False))
@@ -570,6 +713,16 @@ class TwingateGui(Gtk.Application):
         self.indicator_menu.append(self._menu_item("Setup...", lambda _item: self.open_terminal("setup")))
         self.indicator_menu.append(self._menu_item("Quit", lambda _item: self.quit()))
         self.indicator_menu.show_all()
+
+    def _rebuild_current_indicator_menu(self):
+        self._rebuild_indicator_menu(
+            self.menu_accounts,
+            self.menu_active,
+            self.menu_online,
+            self.menu_resource_count,
+            self.menu_pending_count,
+            self.menu_details,
+        )
 
     def show_window(self):
         if self.window is None:
@@ -687,6 +840,7 @@ class TwingateGui(Gtk.Application):
         window.set_titlebar(header)
 
         header.pack_start(self._icon_button("view-refresh-symbolic", "Refresh", lambda _button: self.refresh()))
+        header.pack_start(self._icon_button("software-update-available-symbolic", "Check for updates", lambda _button: self.check_for_updates(manual=True)))
         header.pack_start(self._icon_button("web-browser-symbolic", "Open account browser", lambda _button: self.open_active_account_browser()))
         header.pack_end(self._button("Add Account", lambda _button: self.open_terminal("account", "add"), icon="list-add-symbolic"))
 
@@ -715,6 +869,18 @@ class TwingateGui(Gtk.Application):
         self.content_box.set_hexpand(True)
         self.content_box.set_size_request(760, -1)
         scroll.add(self.content_box)
+
+        self.update_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.update_box.set_border_width(14)
+        self.update_box.get_style_context().add_class("update-panel")
+        self.update_box.set_hexpand(True)
+        self.update_label = self._label("Update available", "detail-value")
+        self.update_box.pack_start(self.update_label, True, True, 0)
+        self.update_button = self._button("Install Update", lambda _button: self.install_update(), "primary", "software-update-available-symbolic")
+        self.update_box.pack_end(self.update_button, False, False, 0)
+        self.content_box.pack_start(self.update_box, False, False, 0)
+        self.update_box.set_no_show_all(True)
+        self.update_box.hide()
 
         top_cards = Gtk.FlowBox()
         top_cards.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -907,6 +1073,14 @@ class TwingateGui(Gtk.Application):
         self.refresh()
         return True
 
+    def _initial_update_check(self):
+        self.check_for_updates(manual=False)
+        return False
+
+    def _periodic_update_check(self):
+        self.check_for_updates(manual=False)
+        return True
+
     def _refresh_worker(self):
         status = run_twingate("status")
         accounts = run_twingate("account", "list")
@@ -1023,6 +1197,12 @@ class TwingateGui(Gtk.Application):
         if self.connection_resources_detail_label is not None:
             self.connection_resources_detail_label.set_text(resources_summary)
 
+        self.menu_accounts = accounts
+        self.menu_active = active
+        self.menu_online = online
+        self.menu_resource_count = resource_count
+        self.menu_pending_count = pending_count
+        self.menu_details = details
         self._rebuild_indicator_menu(accounts, active, online, resource_count, pending_count, details)
 
         if online and active:
@@ -1096,6 +1276,93 @@ class TwingateGui(Gtk.Application):
             self.notify("Twingate command failed", text)
         self.refresh()
         return False
+
+    def check_for_updates(self, manual: bool = False):
+        if self.update_check_running or self.update_install_running:
+            return
+        self.update_check_running = True
+        if manual:
+            self.update_status = "Checking for updates..."
+            self._set_output("Checking GitHub for Twingate Linux GUI updates...")
+            self._sync_update_ui()
+        threading.Thread(target=self._update_check_worker, args=(manual,), daemon=True).start()
+
+    def _update_check_worker(self, manual: bool):
+        try:
+            update = fetch_latest_update()
+            error = None
+        except Exception as exc:
+            update = None
+            error = str(exc)
+        GLib.idle_add(self._apply_update_check, update, error, manual)
+
+    def _apply_update_check(self, update: UpdateInfo | None, error: str | None, manual: bool):
+        self.update_check_running = False
+        if error:
+            self.update_status = f"Update check failed: {error}"
+            if manual:
+                self.notify("Update check failed", error)
+                self._set_output(self.update_status)
+        elif update:
+            self.update_info = update
+            self.update_status = f"Update {update.tag} available"
+            self.notify("Twingate update available", f"{update.tag} is ready to install.")
+            self._set_output(f"{self.update_status}\n{update.page_url}")
+        else:
+            self.update_info = None
+            self.update_status = f"Version {APP_VERSION} is current"
+            if manual:
+                self.notify("Twingate is up to date", self.update_status)
+                self._set_output(self.update_status)
+        self._sync_update_ui()
+        return False
+
+    def install_update(self):
+        if self.update_info is None or self.update_install_running:
+            return
+        self.update_install_running = True
+        self.update_status = f"Installing {self.update_info.tag}..."
+        self._set_output(self.update_status)
+        self._sync_update_ui()
+        threading.Thread(target=self._install_update_worker, args=(self.update_info,), daemon=True).start()
+
+    def _install_update_worker(self, update: UpdateInfo):
+        try:
+            launcher = install_release_update(update)
+            error = None
+        except Exception as exc:
+            launcher = ""
+            error = str(exc)
+        GLib.idle_add(self._apply_update_install, update, launcher, error)
+
+    def _apply_update_install(self, update: UpdateInfo, launcher: str, error: str | None):
+        self.update_install_running = False
+        if error:
+            self.update_status = f"Update install failed: {error}"
+            self.notify("Update install failed", error)
+            self._set_output(self.update_status)
+            self._sync_update_ui()
+            return False
+
+        self.update_status = f"Updated to {update.tag}; restarting..."
+        self.notify("Update installed", f"Restarting Twingate {update.tag}.")
+        self._set_output(self.update_status)
+        self._sync_update_ui()
+        if launcher and os.path.exists(launcher):
+            subprocess.Popen([launcher])
+        self.quit()
+        return False
+
+    def _sync_update_ui(self):
+        if self.update_box is not None and self.update_label is not None:
+            self.update_label.set_text(self.update_status)
+            if self.update_button is not None:
+                self.update_button.set_sensitive(self.update_info is not None and not self.update_install_running)
+            if self.update_info is not None or self.update_install_running:
+                self.update_box.show_all()
+            else:
+                self.update_box.hide()
+        self._rebuild_current_indicator_menu()
 
     def switch_account(self, account_id: str):
         self._set_output(f"Switching account: {account_id}")
