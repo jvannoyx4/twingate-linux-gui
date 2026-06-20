@@ -2,7 +2,9 @@
 import csv
 import json
 import os
+import pty
 import re
+import select
 import shutil
 import shlex
 import subprocess
@@ -26,8 +28,9 @@ from gi.repository import AppIndicator3, Gdk, GLib, Gtk, Notify, Pango
 
 
 APP_ID = "io.github.twingate_linux_gui.TwingateGui"
+APP_CLASS = "twingate-gui"
 APP_NAME = "Twingate"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 RELEASE_API_URL = "https://api.github.com/repos/jvannoyx4/twingate-linux-gui/releases/latest"
 RELEASE_PAGE_URL = "https://github.com/jvannoyx4/twingate-linux-gui/releases/latest"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +39,11 @@ ICON_ONLINE = "twingate-tray-online"
 ICON_OFFLINE = "twingate-tray-offline"
 ICON_FILE = os.path.join(ASSET_DIR, "twingate-tray-online.svg")
 CHROME_PROFILE_PICKER = os.path.join(APP_DIR, "twingate-chrome-profile-picker.py")
+
+GLib.set_application_name(APP_NAME)
+GLib.set_prgname(APP_CLASS)
+if hasattr(Gdk, "set_program_class"):
+    Gdk.set_program_class(APP_CLASS)
 
 
 @dataclass
@@ -264,6 +272,95 @@ def run_twingate_auth(resource_name: str, account_id: str) -> CommandResult:
     return CommandResult(command, returncode, "\n".join(output), "")
 
 
+def run_twingate_account_add(network: str, allow_diagnostics: bool = False) -> CommandResult:
+    command = ["twingate", "--disable-colors", "account", "add", "--disable-network-verification"]
+    network = network.strip().removeprefix("https://").removeprefix("http://")
+    network = network.strip().strip("/")
+    network = network.split("/", 1)[0]
+    network = network.removesuffix(".twingate.com").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", network):
+        return CommandResult(command, 2, "", "Enter only the Twingate network name, for example 'acme'.")
+
+    diagnostics_answer = "y\n" if allow_diagnostics else "n\n"
+    prompt_answers = [
+        ("do you want to change it?", "y\n"),
+        ("enter the name of your twingate network", f"{network}\n"),
+        ("do you want to switch to this account now?", "y\n"),
+        ("restart now?", "y\n"),
+        ("press [enter] to continue", "\n"),
+        ("do you want to try to connect anyway?", "n\n"),
+        ("diagnostic", diagnostics_answer),
+        ("analytics", diagnostics_answer),
+        ("telemetry", diagnostics_answer),
+    ]
+    answered: dict[str, float] = {}
+    output: list[str] = []
+    output_text = ""
+    returncode = 124
+    pid = None
+    master_fd = None
+
+    try:
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            os.execvpe(command[0], command, twingate_env(include_browser=True))
+
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            ready, _write, _error = select.select([master_fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                text = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                output.append(text)
+                output_text += text
+                lowered = output_text.lower()
+                now = time.monotonic()
+                for prompt, answer in prompt_answers:
+                    if prompt in lowered and now - answered.get(prompt, 0) > 1.5:
+                        os.write(master_fd, answer.encode("utf-8"))
+                        answered[prompt] = now
+            try:
+                done_pid, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                done_pid = pid
+                status = 0
+            if done_pid == pid:
+                returncode = os.waitstatus_to_exitcode(status)
+                break
+        else:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    except FileNotFoundError as exc:
+        return CommandResult(command, 127, "", str(exc))
+    except OSError as exc:
+        return CommandResult(command, 1, "".join(output), str(exc))
+    finally:
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        if pid:
+            try:
+                done_pid, status = os.waitpid(pid, os.WNOHANG)
+                if done_pid == pid and returncode == 124:
+                    returncode = os.waitstatus_to_exitcode(status)
+            except ChildProcessError:
+                pass
+
+    text = "".join(output).strip()
+    if returncode == 124:
+        return CommandResult(command, returncode, text, "Account setup timed out.")
+    return CommandResult(command, returncode, text, "")
+
+
 def parse_resources(output: str) -> list[dict[str, str]]:
     rows = []
     reader = csv.reader(StringIO(output), delimiter="\t")
@@ -419,6 +516,20 @@ class TwingateGui(Gtk.Application):
         self.connection_interface_detail_label = None
         self.connection_routes_detail_label = None
         self.connection_resources_detail_label = None
+        self.connection_action_stack = None
+        self.connect_button = None
+        self.disconnect_button = None
+        self.start_button = None
+        self.stop_button = None
+        self.summary_network_label = None
+        self.summary_user_label = None
+        self.summary_tunnel_label = None
+        self.summary_resources_label = None
+        self.summary_refresh_label = None
+        self.resource_search_entry = None
+        self.resource_filter_mode = "all"
+        self.resource_filter_buttons = {}
+        self.resources_filter = None
         self.account_cards_box = None
         self.accounts_tree = None
         self.resources_tree = None
@@ -431,6 +542,8 @@ class TwingateGui(Gtk.Application):
         self.status_item = None
         self.connect_item = None
         self.disconnect_item = None
+        self.start_item = None
+        self.stop_item = None
         self.last_status = "unknown"
         self.refresh_running = False
         self.update_check_running = False
@@ -512,6 +625,18 @@ class TwingateGui(Gtk.Application):
             font-size: 11px;
         }
 
+        .status-strip {
+            background: #222227;
+            border: 1px solid #2f2f36;
+            border-radius: 8px;
+        }
+
+        .summary-item {
+            background: #1a1a1d;
+            border: 1px solid #2f2f36;
+            border-radius: 8px;
+        }
+
         .network-card {
             background: #1a1a1d;
             color: #e8e8ec;
@@ -521,6 +646,13 @@ class TwingateGui(Gtk.Application):
 
         .network-card-active {
             border: 1px solid #3b82f6;
+        }
+
+        .network-menu-button {
+            background: #222227;
+            color: #e8e8ec;
+            border: 1px solid #2f2f36;
+            padding: 4px 8px;
         }
 
         .network-avatar {
@@ -554,6 +686,22 @@ class TwingateGui(Gtk.Application):
             padding: 7px 12px;
         }
 
+        button.action-primary {
+            background: #0b0b0d;
+            color: #ffffff;
+            border: 1px solid #2f2f36;
+            font-weight: 700;
+            padding: 10px 12px;
+        }
+
+        button.action-danger {
+            background: #2a1f22;
+            color: #f4f4f5;
+            border: 1px solid #493238;
+            font-weight: 700;
+            padding: 10px 12px;
+        }
+
         button.secondary {
             background: #222227;
             color: #e8e8ec;
@@ -583,6 +731,26 @@ class TwingateGui(Gtk.Application):
             background: #1a1a1d;
             border: 1px solid #2f2f36;
             border-radius: 8px;
+        }
+
+        .filter-bar {
+            background: #1a1a1d;
+            border: 1px solid #2f2f36;
+            border-radius: 8px;
+        }
+
+        entry.search {
+            background: #222227;
+            color: #e8e8ec;
+            border: 1px solid #2f2f36;
+            padding: 8px 10px;
+        }
+
+        button.filter-active {
+            background: #0b0b0d;
+            color: #ffffff;
+            border: 1px solid #3b82f6;
+            font-weight: 700;
         }
 
         .update-panel {
@@ -697,17 +865,17 @@ class TwingateGui(Gtk.Application):
                 )
         else:
             self.indicator_menu.append(self._menu_item("No accounts found", sensitive=False))
-        self.indicator_menu.append(
-            self._menu_item("Add Account...", lambda _item: self.open_terminal("account", "add"))
-        )
+        self.indicator_menu.append(self._menu_item("Add Account...", lambda _item: self.show_add_account_dialog()))
 
         self.indicator_menu.append(Gtk.SeparatorMenuItem())
         self.connect_item = self._menu_item("Connect", lambda _item: self.run_action("connect"), sensitive=not online)
         self.disconnect_item = self._menu_item("Disconnect", lambda _item: self.run_action("disconnect"), sensitive=online)
         self.indicator_menu.append(self.connect_item)
         self.indicator_menu.append(self.disconnect_item)
-        self.indicator_menu.append(self._menu_item("Start Service", lambda _item: self.run_action("start")))
-        self.indicator_menu.append(self._menu_item("Stop Service", lambda _item: self.run_action("stop")))
+        self.start_item = self._menu_item("Start Service", lambda _item: self.run_action("start"), sensitive=not online)
+        self.stop_item = self._menu_item("Stop Service", lambda _item: self.run_action("stop"), sensitive=online)
+        self.indicator_menu.append(self.start_item)
+        self.indicator_menu.append(self.stop_item)
 
         self.indicator_menu.append(Gtk.SeparatorMenuItem())
         self.indicator_menu.append(self._menu_item("Setup...", lambda _item: self.open_terminal("setup")))
@@ -768,6 +936,17 @@ class TwingateGui(Gtk.Application):
         box.pack_start(title_label, False, False, 0)
         return box, value_label
 
+    def _summary_item(self, title: str, value: str) -> tuple[Gtk.Box, Gtk.Label]:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.set_border_width(12)
+        box.set_hexpand(True)
+        box.get_style_context().add_class("summary-item")
+        title_label = self._label(title, "metric-label")
+        value_label = self._label(value, "detail-value")
+        box.pack_start(title_label, False, False, 0)
+        box.pack_start(value_label, False, False, 0)
+        return box, value_label
+
     def _detail_row(self, title: str, value: str = "-") -> tuple[Gtk.Box, Gtk.Label]:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         title_label = self._label(title, "muted")
@@ -777,39 +956,68 @@ class TwingateGui(Gtk.Application):
         row.pack_start(value_label, True, True, 0)
         return row, value_label
 
-    def _network_card(self, account: Account) -> Gtk.Button:
-        button = Gtk.Button()
-        button.get_style_context().add_class("network-card")
+    def _network_card(self, account: Account) -> Gtk.Box:
+        card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        card.set_border_width(20)
+        card.get_style_context().add_class("network-card")
         if account.active:
-            button.get_style_context().add_class("network-card-active")
-        button.connect("clicked", lambda _button, account_id=account.account_id: self.switch_account(account_id))
-
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
-        row.set_border_width(10)
-        button.add(row)
+            card.get_style_context().add_class("network-card-active")
 
         avatar = self._label((account.network or account.email or "?")[0].upper(), "network-avatar", 0.5)
         avatar.set_size_request(58, 58)
-        row.pack_start(avatar, False, False, 0)
+        card.pack_start(avatar, False, False, 0)
 
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        row.pack_start(text, True, True, 0)
+        card.pack_start(text, True, True, 0)
         text.pack_start(self._label(account.network, "title"), False, False, 0)
         text.pack_start(self._label(account.network_url, "subtitle"), False, False, 0)
         text.pack_start(self._label(account.email, "subtitle"), False, False, 0)
 
+        actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.pack_end(actions, False, False, 0)
         if account.active:
             active = self._label("● Active", "accent", 1)
             active.set_width_chars(10)
-            row.pack_end(active, False, False, 0)
+            actions.pack_start(active, False, False, 0)
 
-        return button
+        menu_button = Gtk.MenuButton()
+        menu_button.set_tooltip_text(f"Actions for {account.network}")
+        menu_button.get_style_context().add_class("network-menu-button")
+        menu_button.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        menu = Gtk.Menu()
+        switch_item = self._menu_item(
+            "Switch",
+            lambda _item, account_id=account.account_id: self.switch_account(account_id),
+            sensitive=not account.active,
+        )
+        browser_item = self._menu_item(
+            "Open Browser",
+            lambda _item, account_id=account.account_id: launch_chrome_for_account(account_id),
+        )
+        refresh_item = self._menu_item("Refresh Resources", lambda _item: self.refresh())
+        menu.append(switch_item)
+        menu.append(browser_item)
+        menu.append(refresh_item)
+        menu.show_all()
+        menu_button.set_popup(menu)
+        actions.pack_end(menu_button, False, False, 0)
 
-    def _column(self, title: str, index: int, width: int | None = None, visible: bool = True) -> Gtk.TreeViewColumn:
+        return card
+
+    def _column(
+        self,
+        title: str,
+        index: int,
+        width: int | None = None,
+        visible: bool = True,
+        auth_index: int | None = None,
+    ) -> Gtk.TreeViewColumn:
         renderer = Gtk.CellRendererText()
         renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
         renderer.set_property("foreground", "#e8e8ec")
         column = Gtk.TreeViewColumn(title, renderer, text=index)
+        if auth_index is not None:
+            column.set_cell_data_func(renderer, self._resource_cell_style, auth_index)
         column.set_resizable(True)
         column.set_sort_column_id(index)
         column.set_visible(visible)
@@ -817,11 +1025,22 @@ class TwingateGui(Gtk.Application):
             column.set_min_width(width)
         return column
 
+    def _resource_cell_style(self, _column, renderer, model, tree_iter, auth_index: int):
+        auth = str(model[tree_iter][auth_index] or "").lower()
+        if "pending" in auth:
+            renderer.set_property("foreground", "#f59e0b")
+            renderer.set_property("weight", 700)
+        else:
+            renderer.set_property("foreground", "#e8e8ec")
+            renderer.set_property("weight", 400)
+
     def _create_window(self):
         window = Gtk.ApplicationWindow(application=self)
         window.set_title("Twingate")
         window.set_default_size(1200, 780)
         window.set_size_request(980, 640)
+        if hasattr(window, "set_wmclass"):
+            window.set_wmclass(APP_CLASS, APP_NAME)
         if os.path.exists(ICON_FILE):
             window.set_icon_from_file(ICON_FILE)
         else:
@@ -842,7 +1061,7 @@ class TwingateGui(Gtk.Application):
         header.pack_start(self._icon_button("view-refresh-symbolic", "Refresh", lambda _button: self.refresh()))
         header.pack_start(self._icon_button("software-update-available-symbolic", "Check for updates", lambda _button: self.check_for_updates(manual=True)))
         header.pack_start(self._icon_button("web-browser-symbolic", "Open account browser", lambda _button: self.open_active_account_browser()))
-        header.pack_end(self._button("Add Account", lambda _button: self.open_terminal("account", "add"), icon="list-add-symbolic"))
+        header.pack_end(self._button("Add Account", lambda _button: self.show_add_account_dialog(), icon="list-add-symbolic"))
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
         top.set_border_width(22)
@@ -882,6 +1101,30 @@ class TwingateGui(Gtk.Application):
         self.update_box.set_no_show_all(True)
         self.update_box.hide()
 
+        status_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        status_strip.set_border_width(12)
+        status_strip.set_hexpand(True)
+        status_strip.get_style_context().add_class("status-strip")
+        self.content_box.pack_start(status_strip, False, False, 0)
+        for box, label_attr in [
+            self._summary_item("Network", "None"),
+            self._summary_item("User", "None"),
+            self._summary_item("Tunnel", "Unavailable"),
+            self._summary_item("Resources", "0"),
+            self._summary_item("Last refresh", "Never"),
+        ]:
+            status_strip.pack_start(box, True, True, 0)
+            if self.summary_network_label is None:
+                self.summary_network_label = label_attr
+            elif self.summary_user_label is None:
+                self.summary_user_label = label_attr
+            elif self.summary_tunnel_label is None:
+                self.summary_tunnel_label = label_attr
+            elif self.summary_resources_label is None:
+                self.summary_resources_label = label_attr
+            elif self.summary_refresh_label is None:
+                self.summary_refresh_label = label_attr
+
         top_cards = Gtk.FlowBox()
         top_cards.set_selection_mode(Gtk.SelectionMode.NONE)
         top_cards.set_column_spacing(18)
@@ -917,7 +1160,7 @@ class TwingateGui(Gtk.Application):
         account_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         account_card.pack_start(account_actions, False, False, 0)
         for button in [
-            self._button("Add Account", lambda _button: self.open_terminal("account", "add"), "primary", "list-add-symbolic"),
+            self._button("Add Account", lambda _button: self.show_add_account_dialog(), "primary", "list-add-symbolic"),
             self._button("Open Browser", lambda _button: self.open_active_account_browser(), icon="web-browser-symbolic"),
             self._button("Setup", lambda _button: self.open_terminal("setup"), icon="preferences-system-symbolic"),
         ]:
@@ -931,17 +1174,39 @@ class TwingateGui(Gtk.Application):
         connection_card.set_hexpand(True)
         top_cards.add(connection_card)
         connection_card.pack_start(self._label("Connection", "section-title"), False, False, 0)
+
+        self.connection_action_stack = Gtk.Stack()
+        self.connection_action_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.connection_action_stack.set_transition_duration(160)
+        self.connect_button = self._button(
+            "Connect",
+            lambda _button: self.run_action("connect"),
+            "action-primary",
+            "network-transmit-receive-symbolic",
+        )
+        self.disconnect_button = self._button(
+            "Disconnect",
+            lambda _button: self.run_action("disconnect"),
+            "action-danger",
+            "network-offline-symbolic",
+        )
+        for name, button in [("connect", self.connect_button), ("disconnect", self.disconnect_button)]:
+            button.set_hexpand(True)
+            self.connection_action_stack.add_named(button, name)
+        self.connection_action_stack.set_visible_child_name("connect")
+        connection_card.pack_start(self.connection_action_stack, False, False, 0)
+
         connection_grid = Gtk.Grid()
         connection_grid.set_column_spacing(10)
         connection_grid.set_row_spacing(10)
-        for button, left, top_row in [
-            (self._button("Connect", lambda _button: self.run_action("connect"), icon="network-transmit-receive-symbolic"), 0, 0),
-            (self._button("Disconnect", lambda _button: self.run_action("disconnect"), icon="network-offline-symbolic"), 1, 0),
-            (self._button("Start", lambda _button: self.run_action("start"), icon="media-playback-start-symbolic"), 0, 1),
-            (self._button("Stop", lambda _button: self.run_action("stop"), icon="media-playback-stop-symbolic"), 1, 1),
+        self.start_button = self._button("Start", lambda _button: self.run_action("start"), icon="media-playback-start-symbolic")
+        self.stop_button = self._button("Stop", lambda _button: self.run_action("stop"), icon="media-playback-stop-symbolic")
+        for button, left in [
+            (self.start_button, 0),
+            (self.stop_button, 1),
         ]:
             button.set_hexpand(True)
-            connection_grid.attach(button, left, top_row, 1, 1)
+            connection_grid.attach(button, left, 0, 1, 1)
         connection_card.pack_start(connection_grid, False, False, 0)
 
         details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -990,17 +1255,39 @@ class TwingateGui(Gtk.Application):
         metrics.pack_start(pending_metric, False, False, 0)
         metrics.pack_start(refresh_metric, False, False, 0)
 
+        filter_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        filter_bar.set_border_width(10)
+        filter_bar.get_style_context().add_class("filter-bar")
+        resources_card.pack_start(filter_bar, False, False, 0)
+
+        self.resource_search_entry = Gtk.SearchEntry()
+        self.resource_search_entry.set_placeholder_text("Search resources, addresses, aliases")
+        self.resource_search_entry.set_hexpand(True)
+        self.resource_search_entry.get_style_context().add_class("search")
+        self.resource_search_entry.connect("search-changed", lambda _entry: self._refilter_resources())
+        filter_bar.pack_start(self.resource_search_entry, True, True, 0)
+
+        for mode, label in [("all", "All"), ("pending", "Needs Auth"), ("ready", "Authenticated")]:
+            toggle = Gtk.ToggleButton(label=label)
+            toggle.get_style_context().add_class("secondary")
+            toggle.connect("toggled", self._resource_filter_toggled, mode)
+            self.resource_filter_buttons[mode] = toggle
+            filter_bar.pack_start(toggle, False, False, 0)
+        self.resource_filter_buttons["all"].set_active(True)
+
         self.resources_store = Gtk.ListStore(str, str, str, str, str)
-        self.resources_tree = Gtk.TreeView(model=self.resources_store)
+        self.resources_filter = self.resources_store.filter_new()
+        self.resources_filter.set_visible_func(self._resource_visible)
+        self.resources_tree = Gtk.TreeView(model=self.resources_filter)
         self.resources_tree.set_headers_visible(True)
         self.resources_tree.get_style_context().add_class("resource-table")
         self.resources_tree.set_enable_search(True)
         self.resources_tree.connect("row-activated", self._resource_activated)
-        self.resources_tree.append_column(self._column("Account", 0, visible=False))
-        self.resources_tree.append_column(self._column("Resource", 1, 220))
-        self.resources_tree.append_column(self._column("Address", 2, 190))
-        self.resources_tree.append_column(self._column("Alias", 3, 180))
-        self.resources_tree.append_column(self._column("Authentication", 4, 170))
+        self.resources_tree.append_column(self._column("Account", 0, visible=False, auth_index=4))
+        self.resources_tree.append_column(self._column("Resource", 1, 220, auth_index=4))
+        self.resources_tree.append_column(self._column("Address", 2, 190, auth_index=4))
+        self.resources_tree.append_column(self._column("Alias", 3, 180, auth_index=4))
+        self.resources_tree.append_column(self._column("Authentication", 4, 170, auth_index=4))
 
         resource_scroll = Gtk.ScrolledWindow()
         resource_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1035,6 +1322,38 @@ class TwingateGui(Gtk.Application):
         window.hide()
         return True
 
+    def _resource_filter_toggled(self, button: Gtk.ToggleButton, mode: str):
+        if not button.get_active():
+            return
+        self.resource_filter_mode = mode
+        for other_mode, other_button in self.resource_filter_buttons.items():
+            if other_mode != mode:
+                other_button.set_active(False)
+            context = other_button.get_style_context()
+            if other_mode == mode:
+                context.add_class("filter-active")
+            else:
+                context.remove_class("filter-active")
+        self._refilter_resources()
+
+    def _refilter_resources(self):
+        if self.resources_filter is not None:
+            self.resources_filter.refilter()
+
+    def _resource_visible(self, model, tree_iter, _data=None) -> bool:
+        search = ""
+        if self.resource_search_entry is not None:
+            search = self.resource_search_entry.get_text().strip().lower()
+        fields = [str(model[tree_iter][index] or "") for index in range(1, 5)]
+        auth = fields[3].lower()
+        if self.resource_filter_mode == "pending" and "pending" not in auth:
+            return False
+        if self.resource_filter_mode == "ready" and "pending" in auth:
+            return False
+        if search and search not in " ".join(fields).lower():
+            return False
+        return True
+
     def _resource_activated(self, tree, path, _column):
         model = tree.get_model()
         row = model[path]
@@ -1042,7 +1361,7 @@ class TwingateGui(Gtk.Application):
         resource_name = row[1]
         auth_status = row[4]
         if account_id and resource_name:
-            if auth_status.lower() != "pending":
+            if "pending" not in auth_status.lower():
                 self.notify("Resource does not need authentication", f"{resource_name}: {auth_status}")
                 return
             self.switch_and_auth(account_id, resource_name)
@@ -1066,7 +1385,7 @@ class TwingateGui(Gtk.Application):
         if self.refresh_running:
             return
         self.refresh_running = True
-        self._set_output("Refreshing...")
+        self._set_output("Refreshing status, accounts, and resources...")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _periodic_refresh(self):
@@ -1120,6 +1439,16 @@ class TwingateGui(Gtk.Application):
             self.connect_item.set_sensitive(not online)
         if self.disconnect_item is not None:
             self.disconnect_item.set_sensitive(online)
+        if self.start_item is not None:
+            self.start_item.set_sensitive(not online)
+        if self.stop_item is not None:
+            self.stop_item.set_sensitive(online)
+        if self.connection_action_stack is not None:
+            self.connection_action_stack.set_visible_child_name("disconnect" if online else "connect")
+        if self.start_button is not None:
+            self.start_button.set_sensitive(not online)
+        if self.stop_button is not None:
+            self.stop_button.set_sensitive(online)
 
         active = next((account for account in accounts if account.active), None)
         if self.account_label is not None:
@@ -1162,7 +1491,8 @@ class TwingateGui(Gtk.Application):
                     continue
                 for item in resources:
                     resource_count += 1
-                    if item["auth"].lower() == "pending":
+                    pending = item["auth"].lower() == "pending"
+                    if pending:
                         pending_count += 1
                     self.resources_store.append(
                         [
@@ -1170,7 +1500,7 @@ class TwingateGui(Gtk.Application):
                             item["name"],
                             item["address"],
                             "" if item["alias"] == "-" else item["alias"],
-                            item["auth"] or "Ready",
+                            "● Pending" if pending else item["auth"] or "Ready",
                         ]
                     )
             if self.resource_count_label is not None:
@@ -1178,12 +1508,28 @@ class TwingateGui(Gtk.Application):
             if self.pending_count_label is not None:
                 self.pending_count_label.set_text(str(pending_count))
             if self.last_refresh_label is not None:
-                self.last_refresh_label.set_text(datetime.now().strftime("%I:%M %p").lstrip("0"))
+                refresh_time = datetime.now().strftime("%I:%M %p").lstrip("0")
+                self.last_refresh_label.set_text(refresh_time)
+            else:
+                refresh_time = datetime.now().strftime("%I:%M %p").lstrip("0")
+            if self.resources_filter is not None:
+                self.resources_filter.refilter()
 
         active_account = f"{active.email} / {active.network}" if active else "None"
         resources_summary = f"{resource_count} available"
         if pending_count:
             resources_summary = f"{resources_summary}, {pending_count} need auth"
+        if self.summary_network_label is not None:
+            self.summary_network_label.set_text(active.network if active else "None")
+        if self.summary_user_label is not None:
+            self.summary_user_label.set_text(active.email if active else "None")
+        if self.summary_tunnel_label is not None:
+            tunnel = details.tunnel_ip if details.tunnel_ip != "Unavailable" else details.interface
+            self.summary_tunnel_label.set_text(tunnel)
+        if self.summary_resources_label is not None:
+            self.summary_resources_label.set_text(resources_summary)
+        if self.summary_refresh_label is not None:
+            self.summary_refresh_label.set_text(refresh_time)
         if self.connection_status_detail_label is not None:
             self.connection_status_detail_label.set_text("Online" if online else self.last_status.title())
         if self.connection_account_detail_label is not None:
@@ -1364,6 +1710,100 @@ class TwingateGui(Gtk.Application):
                 self.update_box.hide()
         self._rebuild_current_indicator_menu()
 
+    def show_add_account_dialog(self):
+        parent = self.window if self.window is not None else None
+        dialog = Gtk.Dialog(
+            title="Add Twingate Account",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        add_button = dialog.add_button("Add Account", Gtk.ResponseType.OK)
+        add_button.get_style_context().add_class("primary")
+
+        content = dialog.get_content_area()
+        content.set_spacing(14)
+        content.set_border_width(18)
+
+        intro = self._label("Enter the first part of your Twingate URL. Authentication will open in your browser.", "muted")
+        intro.set_line_wrap(True)
+        content.pack_start(intro, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(10)
+        content.pack_start(grid, False, False, 0)
+
+        network_label = self._label("Network", "detail-value")
+        network_label.set_width_chars(12)
+        network_entry = Gtk.Entry()
+        network_entry.set_placeholder_text("acme")
+        network_entry.set_activates_default(True)
+        network_entry.set_width_chars(22)
+        network_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        network_box.set_hexpand(True)
+        network_box.pack_start(network_entry, True, True, 0)
+        suffix = self._label(".twingate.com", "detail-value", 0)
+        suffix.set_selectable(False)
+        suffix.set_margin_start(10)
+        network_box.pack_start(suffix, False, False, 0)
+        grid.attach(network_label, 0, 0, 1, 1)
+        grid.attach(network_box, 1, 0, 1, 1)
+
+        help_text = self._label("Example: enter 'acme' for acme.twingate.com.", "muted")
+        help_text.set_line_wrap(True)
+        content.pack_start(help_text, False, False, 0)
+
+        diagnostics_check = Gtk.CheckButton()
+        diagnostics_check.set_active(False)
+        diagnostics_check.set_valign(Gtk.Align.START)
+        diagnostics_check.set_margin_top(2)
+        diagnostics_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        diagnostics_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        diagnostics_title = self._label("Send diagnostics to Twingate", "detail-value")
+        diagnostics_note = self._label("Off by default. Leave this off unless you intentionally want to share diagnostics.", "muted")
+        diagnostics_note.set_line_wrap(True)
+        diagnostics_title.set_mnemonic_widget(diagnostics_check)
+        diagnostics_title.connect("button-press-event", lambda _label, _event: diagnostics_check.set_active(not diagnostics_check.get_active()))
+        diagnostics_text.pack_start(diagnostics_title, False, False, 0)
+        diagnostics_text.pack_start(diagnostics_note, False, False, 0)
+        diagnostics_row.pack_start(diagnostics_check, False, False, 0)
+        diagnostics_row.pack_start(diagnostics_text, True, True, 0)
+        content.pack_start(diagnostics_row, False, False, 0)
+
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.show_all()
+        response = dialog.run()
+        network = network_entry.get_text().strip()
+        allow_diagnostics = diagnostics_check.get_active()
+        dialog.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            return
+        if not network:
+            self.notify("Network required", "Enter your Twingate network name.")
+            return
+        self.add_account(network, allow_diagnostics)
+
+    def add_account(self, network: str, allow_diagnostics: bool = False):
+        cleaned = network.strip()
+        self._set_output(f"Adding Twingate account for network: {cleaned}")
+        threading.Thread(target=self._add_account_worker, args=(cleaned, allow_diagnostics), daemon=True).start()
+
+    def _add_account_worker(self, network: str, allow_diagnostics: bool):
+        result = run_twingate_account_add(network, allow_diagnostics)
+        GLib.idle_add(self._apply_add_account_result, result)
+
+    def _apply_add_account_result(self, result: CommandResult):
+        text = result.stdout or result.stderr or f"Command exited with {result.returncode}"
+        self._set_output(f"$ {' '.join(result.command)}\n{text}")
+        if result.returncode != 0:
+            self.notify("Account setup failed", text)
+        else:
+            self.notify("Account added", "Twingate account setup completed.")
+        self.refresh()
+        return False
+
     def switch_account(self, account_id: str):
         self._set_output(f"Switching account: {account_id}")
         threading.Thread(target=self._switch_worker, args=(account_id,), daemon=True).start()
@@ -1421,7 +1861,10 @@ class TwingateGui(Gtk.Application):
 
     def _set_output(self, text: str):
         if self.output_buffer:
-            self.output_buffer.set_text(text)
+            stamp = datetime.now().strftime("%I:%M:%S %p").lstrip("0")
+            entry = f"[{stamp}] {text.strip()}\n\n"
+            end = self.output_buffer.get_end_iter()
+            self.output_buffer.insert(end, entry)
 
 
 def main():

@@ -22,8 +22,8 @@ sudo apt install python3 python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1 gir1
 Download and extract a release:
 
 ```bash
-tar -xzf twingate-linux-gui-0.1.2.tar.gz
-cd twingate-linux-gui-0.1.2
+tar -xzf twingate-linux-gui-0.1.3.tar.gz
+cd twingate-linux-gui-0.1.3
 ./install.sh
 ```
 

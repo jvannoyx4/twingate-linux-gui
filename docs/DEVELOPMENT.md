@@ -15,7 +15,7 @@ python3 -m py_compile twingate-gui.py twingate-chrome-profile-picker.py
 ## Build Release Tarball
 
 ```bash
-VERSION=0.1.2 ./scripts/build-release.sh
+VERSION=0.1.3 ./scripts/build-release.sh
 ```
 
 The release archive is written to `dist/`.

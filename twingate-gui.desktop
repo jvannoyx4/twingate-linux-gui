@@ -7,3 +7,4 @@ Icon=twingate-gui
 Terminal=false
 Categories=Network;Security;
 StartupNotify=true
+StartupWMClass=twingate-gui

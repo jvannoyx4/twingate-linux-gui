@@ -90,14 +90,15 @@ The tarball is written to `dist/`.
 Set a specific version:
 
 ```bash
-VERSION=0.1.2 ./scripts/build-release.sh
+VERSION=0.1.3 ./scripts/build-release.sh
 ```
 
 ## Notes
 
 - The app does not bundle account data. Accounts are read from the local Twingate CLI on each machine.
 - Browser profile matching is based on Chrome/Chromium profile metadata on the local machine.
-- Setup and account-add flows open in a terminal because those Twingate CLI flows can be interactive.
+- Add Account uses a small GUI form and runs the Twingate CLI setup in the background.
+- Setup still opens in a terminal because the official CLI setup flow is interactive.
 - The tray indicator requires AppIndicator support. Ubuntu GNOME supports this by default on many installs.
 
 ## License

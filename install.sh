@@ -72,6 +72,8 @@ tar -C "${SOURCE_DIR}" \
   --exclude '__pycache__' \
   --exclude '*.pyc' \
   --exclude '*.log' \
+  --exclude '.env' \
+  --exclude '.env.*' \
   --exclude 'dist' \
   -cf - . | tar -C "${APP_DIR}" -xf -
 

@@ -56,10 +56,18 @@ matches the active Twingate account email, that profile is used automatically.
 If no matching profile is found and `zenity` is installed, the app prompts you to
 choose a profile.
 
-## Interactive Twingate Commands
+## Account Setup
 
-`Setup` and `Add Account` open in a terminal because the Twingate CLI can prompt
-for input during those flows.
+`Add Account` opens a form that asks for the first part of the Twingate URL. For
+`acme.twingate.com`, enter only `acme`; the `.twingate.com` suffix is shown in
+the form and is not editable. The app runs the official Twingate CLI setup in
+the background and opens browser authentication when needed.
+
+Diagnostics sharing is shown as a toggle and defaults to off. When left off, the
+app answers no to diagnostics, analytics, or telemetry prompts.
+
+`Setup` still opens in a terminal because the official CLI setup flow is
+interactive.
 
 ## Updates
 
